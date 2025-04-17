@@ -536,6 +536,7 @@ mongo_cc_library(
         "//src/mongo/db/pipeline/window_function:window_function_exec_removable_range.cpp",
         "//src/mongo/db/pipeline/window_function:window_function_statement.cpp",
         "writer_util.cpp",
+        "document_source_bidirectional_graph_lookup.cpp",
     ],
     hdrs = [
         "//src/mongo/db/query/query_shape:agg_cmd_shape.h",
@@ -664,6 +665,7 @@ mongo_cc_library(
         "//src/mongo/db/pipeline/window_function:window_function_exec_non_removable_range_common.h",
         "//src/mongo/s/query/exec:router_stage_merge.h",
         "//src/mongo/s:transaction_router_resource_yielder.h",
+        "document_source_bidirectional_graph_lookup.h",
     ],
     deps = [
         ":accumulator",
