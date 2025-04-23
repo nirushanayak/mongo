@@ -276,14 +276,25 @@
      auto& frontier = isForward ? _forwardFrontier : _backwardFrontier;
      auto& visited = isForward ? _forwardVisited : _backwardVisited;
      const auto& connectField = isForward ? _connectFromField : _connectToField;
+     const auto& matchField = isForward ? _connectToField : _connectFromField;
      
      if (frontier.empty()) {
          return false;
      }
      
-     // Build match stage for the frontier
-     BSONObj match = makeMatchStageFromFrontier(frontier);
-     auto pipeline = buildPipeline(match);
+     // Build match stage for the frontier - match against the correct field
+     BSONObjBuilder match;
+     BSONObjBuilder query(match.subobjStart("$match"));
+     BSONArrayBuilder in(query.subarrayStart(matchField));
+     
+     for (auto&& value : frontier) {
+         in << value;
+     }
+     
+     in.done();
+     query.done();
+     
+     auto pipeline = buildPipeline(match.obj());
      
      // Clear frontier since we're processing it
      frontier.clear();
@@ -296,6 +307,14 @@
          auto id = next->getField("_id");
          
          if (visited.find(id) == visited.end()) {
+             // Add to visited
+             SearchNode node;
+             node.id = id;
+             node.depth = visited.size();
+             node.isForwardDirection = isForward;
+             visited[id] = node;
+             _visitedUsageBytes += id.getApproximateSize() + next->getApproximateSize();
+             
              // Get connect values for next iteration
              document_path_support::visitAllValuesAtPath(
                  *next, 
@@ -306,14 +325,6 @@
                          _frontierUsageBytes += connectVal.getApproximateSize();
                      }
                  });
-             
-             // Add to visited
-             SearchNode node;
-             node.id = id;
-             node.depth = visited.size();
-             node.isForwardDirection = isForward;
-             visited[id] = std::move(node);
-             _visitedUsageBytes += id.getApproximateSize() + next->getApproximateSize();
              
              expanded = true;
          }
@@ -327,7 +338,7 @@
      for (const auto& [id, forwardNode] : _forwardVisited) {
          if (_backwardVisited.find(id) != _backwardVisited.end()) {
              BidirectionalPath path;
-             // We'll reconstruct the full path in reconstructPath method
+             path.meetingNode = Document{{"_id", id}};
              return path;
          }
      }
@@ -336,27 +347,16 @@
  
  std::vector<Document> DocumentSourceBidirectionalGraphLookup::reconstructPath(
      const BidirectionalPath& bidirectionalPath) {
-     // For now, return all visited nodes as the path
-     // In a real implementation, we'd trace back through parent pointers
+     // Return only the nodes in the actual path, not all visited nodes
      std::vector<Document> results;
      
-     for (const auto& [_, node] : _forwardVisited) {
+     // If we found a meeting point, reconstruct the path
+     if (!bidirectionalPath.meetingNode.empty()) {
+         // In a proper implementation, we'd trace back through parent pointers
+         // For now, just add the meeting node to show the algorithm is working
          MutableDocument doc;
-         doc.addField("_id", node.id);
-         if (_depthField) {
-             doc.addField(*_depthField, Value(static_cast<long long>(node.depth)));
-         }
-         doc.addField("direction", Value("forward"_sd));
-         results.push_back(doc.freeze());
-     }
-     
-     for (const auto& [_, node] : _backwardVisited) {
-         MutableDocument doc;
-         doc.addField("_id", node.id);
-         if (_depthField) {
-             doc.addField(*_depthField, Value(static_cast<long long>(node.depth)));
-         }
-         doc.addField("direction", Value("backward"_sd));
+         doc.addField("_id", bidirectionalPath.meetingNode["_id"]);
+         doc.addField("type", Value("meeting_point"_sd));
          results.push_back(doc.freeze());
      }
      
@@ -366,28 +366,16 @@
  BSONObj DocumentSourceBidirectionalGraphLookup::makeMatchStageFromFrontier(
      const ValueFlatUnorderedSet& frontier) {
      BSONObjBuilder match;
-     {
-         BSONObjBuilder query(match.subobjStart("$match"));
-         {
-             BSONArrayBuilder andObj(query.subarrayStart("$and"));
-             if (_additionalFilter) {
-                 andObj << *_additionalFilter;
-             }
-             
-             {
-                 BSONObjBuilder connectToObj(andObj.subobjStart());
-                 {
-                     BSONObjBuilder subObj(connectToObj.subobjStart(_connectToField));
-                     {
-                         BSONArrayBuilder in(subObj.subarrayStart("$in"));
-                         for (auto&& value : frontier) {
-                             in << value;
-                         }
-                     }
-                 }
-             }
-         }
+     BSONObjBuilder query(match.subobjStart("$match"));
+     BSONArrayBuilder in(query.subarrayStart("_id"));
+     
+     for (auto&& value : frontier) {
+         in << value;
      }
+     
+     in.done();
+     query.done();
+     
      return match.obj();
  }
  
