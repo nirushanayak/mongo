@@ -536,6 +536,7 @@ mongo_cc_library(
         "//src/mongo/db/pipeline/window_function:window_function_statement.cpp",
         "writer_util.cpp",
         "document_source_bidirectional_graph_lookup.cpp",
+        "document_source_bidirectional_graph_lookup.h",
     ],
     hdrs = [
         "//src/mongo/db/query/query_shape:agg_cmd_shape.h",
