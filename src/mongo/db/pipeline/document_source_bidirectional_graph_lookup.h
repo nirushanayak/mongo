@@ -81,6 +81,7 @@
          size_t depth;
          std::vector<Value> path;
          bool isForwardDirection;
+         Value parentId;
      };
  
      struct BidirectionalPath {
@@ -92,8 +93,8 @@
      // Core algorithm methods
      void performBidirectionalSearch();
      bool expandFrontier(bool isForward);
-     boost::optional<BidirectionalPath> checkMeetingPoint();
-     std::vector<Document> reconstructPath(const BidirectionalPath& bidirectionalPath);
+     boost::optional<Value> checkMeetingPoint();
+     std::vector<Document> reconstructPath(Value meetingId);
      BSONObj makeMatchStageFromFrontier(const ValueFlatUnorderedSet& frontier);
      
      std::unique_ptr<Pipeline, PipelineDeleter> buildPipeline(const BSONObj& match);

@@ -206,8 +206,12 @@
          return GetNextResult::makeEOF();
  
      auto input = pSource->getNext();
-     if (!input.isAdvanced())
-         return input;
+     LOGV2(9999999, "doGetNext() - input received: {state}", "state"_attr = input.getStatus());
+
+     if (!input.isAdvanced()) {
+        LOGV2(9999999, "Input not advanced — returning early.");
+        return input;
+    }
  
      _inputDoc = input.releaseDocument();
      _executed = true;
@@ -220,149 +224,328 @@
  }
  
  void DocumentSourceBidirectionalGraphLookup::performBidirectionalSearch() {
-     // Clear previous search state
-     resetSearchState();
-     
-     // Initialize forward search with startWith value
-     auto startVal = _startWith->evaluate(_inputDoc, &pExpCtx->variables);
-     if (startVal.isArray()) {
-         for (const auto& val : startVal.getArray()) {
-             _forwardFrontier.insert(val);
-         }
-     } else {
-         _forwardFrontier.insert(startVal);
-     }
-     
-     // Initialize backward search with target value
-     auto targetVal = _target->evaluate(_inputDoc, &pExpCtx->variables);
-     if (targetVal.isArray()) {
-         for (const auto& val : targetVal.getArray()) {
-             _backwardFrontier.insert(val);
-         }
-     } else {
-         _backwardFrontier.insert(targetVal);
-     }
-     
-     size_t depth = 0;
-     boost::optional<BidirectionalPath> pathFound;
-     
-     while (!_forwardFrontier.empty() && !_backwardFrontier.empty() && 
-            (!_maxDepth || depth <= *_maxDepth)) {
-         
-         // Check if there's a meeting point
-         pathFound = checkMeetingPoint();
-         if (pathFound) {
-             _results = reconstructPath(*pathFound);
-             return;
-         }
-         
-         // Expand both frontiers
-         bool forwardExpanded = expandFrontier(true);
-         bool backwardExpanded = expandFrontier(false);
-         
-         if (!forwardExpanded && !backwardExpanded) {
-             break;  // No more nodes to explore
-         }
-         
-         ++depth;
-         checkMemoryUsage();
-     }
-     
-     // No path found
-     _results.clear();
- }
- 
- bool DocumentSourceBidirectionalGraphLookup::expandFrontier(bool isForward) {
-     auto& frontier = isForward ? _forwardFrontier : _backwardFrontier;
-     auto& visited = isForward ? _forwardVisited : _backwardVisited;
-     const auto& connectField = isForward ? _connectFromField : _connectToField;
-     const auto& matchField = isForward ? _connectToField : _connectFromField;
-     
-     if (frontier.empty()) {
-         return false;
-     }
-     
-     // Build match stage for the frontier - match against the correct field
-     BSONObjBuilder match;
-     BSONObjBuilder query(match.subobjStart("$match"));
-     BSONArrayBuilder in(query.subarrayStart(matchField));
-     
-     for (auto&& value : frontier) {
-         in << value;
-     }
-     
-     in.done();
-     query.done();
-     
-     auto pipeline = buildPipeline(match.obj());
-     
-     // Clear frontier since we're processing it
-     frontier.clear();
-     _frontierUsageBytes = 0;
-     
-     bool expanded = false;
-     
-     // Execute pipeline and process results
-     while (auto next = pipeline->getNext()) {
-         auto id = next->getField("_id");
-         
-         if (visited.find(id) == visited.end()) {
-             // Add to visited
-             SearchNode node;
-             node.id = id;
-             node.depth = visited.size();
-             node.isForwardDirection = isForward;
-             visited[id] = node;
-             _visitedUsageBytes += id.getApproximateSize() + next->getApproximateSize();
-             
-             // Get connect values for next iteration
-             document_path_support::visitAllValuesAtPath(
-                 *next, 
-                 FieldPath(connectField), 
-                 [&](const Value& connectVal) {
-                     if (visited.find(connectVal) == visited.end()) {
-                         frontier.insert(connectVal);
-                         _frontierUsageBytes += connectVal.getApproximateSize();
-                     }
-                 });
-             
-             expanded = true;
-         }
-     }
-     
-     return expanded;
- }
- 
- boost::optional<DocumentSourceBidirectionalGraphLookup::BidirectionalPath> 
- DocumentSourceBidirectionalGraphLookup::checkMeetingPoint() {
-     for (const auto& [id, forwardNode] : _forwardVisited) {
-         if (_backwardVisited.find(id) != _backwardVisited.end()) {
-             BidirectionalPath path;
-             path.meetingNode = Document{{"_id", id}};
-             return path;
-         }
-     }
-     return boost::none;
- }
- 
- std::vector<Document> DocumentSourceBidirectionalGraphLookup::reconstructPath(
-     const BidirectionalPath& bidirectionalPath) {
-     // Return only the nodes in the actual path, not all visited nodes
-     std::vector<Document> results;
-     
-     // If we found a meeting point, reconstruct the path
-     if (!bidirectionalPath.meetingNode.empty()) {
-         // In a proper implementation, we'd trace back through parent pointers
-         // For now, just add the meeting node to show the algorithm is working
-         MutableDocument doc;
-         doc.addField("_id", bidirectionalPath.meetingNode["_id"]);
-         doc.addField("type", Value("meeting_point"_sd));
-         results.push_back(doc.freeze());
-     }
-     
-     return results;
- }
- 
+    LOGV2(9999999, "Starting bidirectional graph search");
+
+    // Clear previous search state
+    resetSearchState();
+    LOGV2(9999999, "Cleared previous search state");
+
+    // Evaluate start and target expressions
+    auto startVal = _startWith->evaluate(_inputDoc, &pExpCtx->variables);
+    auto targetVal = _target->evaluate(_inputDoc, &pExpCtx->variables);
+
+    LOGV2(9999999,
+          "Initial values - startWith: {start}, target: {target}",
+          "start"_attr = startVal.toString(),
+          "target"_attr = targetVal.toString());
+
+    // Populate forward frontier and mark visited
+    if (startVal.isArray()) {
+        for (const auto& val : startVal.getArray()) {
+            _forwardFrontier.insert(val);
+            LOGV2(9999999, "Inserted into forward frontier (array): {val}", "val"_attr = val.toString());
+        }
+    } else {
+        _forwardFrontier.insert(startVal);
+        LOGV2(9999999, "Inserted into forward frontier (single): {val}", "val"_attr = startVal.toString());
+    }
+
+    // Populate backward frontier and mark visited
+    if (targetVal.isArray()) {
+        for (const auto& val : targetVal.getArray()) {
+            _backwardFrontier.insert(val);
+            LOGV2(9999999, "Inserted into backward frontier (array): {val}", "val"_attr = val.toString());
+
+            SearchNode node;
+            node.id = val;
+            node.depth = 0;
+            node.isForwardDirection = false;
+            node.parentId = Value();  // root
+            _backwardVisited[val] = node;
+        }
+    } else {
+        _backwardFrontier.insert(targetVal);
+        LOGV2(9999999, "Inserted into backward frontier (single): {val}", "val"_attr = targetVal.toString());
+
+        SearchNode node;
+        node.id = targetVal;
+        node.depth = 0;
+        node.isForwardDirection = false;
+        node.parentId = Value();  // root
+        _backwardVisited[targetVal] = node;
+    }
+
+    size_t depth = 0;
+
+    // Main search loop
+    while ((!_forwardFrontier.empty() || !_backwardFrontier.empty()) &&
+           (!_maxDepth || depth <= *_maxDepth)) {
+
+        LOGV2(9999999,
+              "Search loop iteration: depth={depth}, forwardFrontier={fwdSize}, backwardFrontier={bwdSize}",
+              "depth"_attr = depth,
+              "fwdSize"_attr = _forwardFrontier.size(),
+              "bwdSize"_attr = _backwardFrontier.size());
+
+        // Expand both directions first
+        bool forwardExpanded = expandFrontier(true);
+        bool backwardExpanded = expandFrontier(false);
+
+        LOGV2(9999999,
+              "Expanded frontiers - forwardExpanded={fwd}, backwardExpanded={bwd}",
+              "fwd"_attr = forwardExpanded,
+              "bwd"_attr = backwardExpanded);
+
+        LOGV2(9999999, "Forward frontier after expansion:");
+        for (const auto& val : _forwardFrontier) {
+            LOGV2(9999999, " → {val}", "val"_attr = val.toString());
+        }
+
+        LOGV2(9999999, "Backward frontier after expansion:");
+        for (const auto& val : _backwardFrontier) {
+            LOGV2(9999999, " ← {val}", "val"_attr = val.toString());
+        }
+
+        LOGV2(9999999, "Visited nodes - Forward:");
+        for (const auto& [id, node] : _forwardVisited) {
+            LOGV2(9999999, " → {id}", "id"_attr = id.toString());
+        }
+
+        LOGV2(9999999, "Visited nodes - Backward:");
+        for (const auto& [id, node] : _backwardVisited) {
+            LOGV2(9999999, " ← {id}", "id"_attr = id.toString());
+        }
+
+        // Check for intersection
+        boost::optional<Value> pathFound = checkMeetingPoint();
+        if (pathFound) {
+            LOGV2(9999999, "Meeting point found at: {id}", "id"_attr = pathFound->toString());
+            _results = reconstructPath(*pathFound);
+            return;
+        }
+
+        if ((_forwardFrontier.empty() && !forwardExpanded) &&
+            (_backwardFrontier.empty() && !backwardExpanded)) {
+            LOGV2(9999999, "All frontiers empty and no expansions possible. Exiting search loop.");
+            break;
+        }
+
+        ++depth;
+        checkMemoryUsage();
+    }
+
+    LOGV2(9999999, "No path found between start and target.");
+    _results.clear();
+}
+
+bool DocumentSourceBidirectionalGraphLookup::expandFrontier(bool isForward) {
+    auto& frontier = isForward ? _forwardFrontier : _backwardFrontier;
+    auto& visited = isForward ? _forwardVisited : _backwardVisited;
+    const auto& connectField = isForward ? _connectFromField : _connectToField;
+    const std::string& matchField = isForward ? _connectToField : _connectFromField;
+
+    if (frontier.empty()) {
+        LOGV2(9999999, "Frontier is empty, skipping expansion.");
+        return false;
+    }
+
+    ValueFlatUnorderedSet frontierSnapshot = frontier;
+    frontier.clear();
+
+    LOGV2(9999999,
+          "Starting expandFrontier. isForward={dir}, snapshot size: {s}",
+          "dir"_attr = isForward,
+          "s"_attr = frontierSnapshot.size());
+
+    _frontierUsageBytes = 0;
+    bool expanded = false;
+
+    for (const auto& valueBeingMatched : frontierSnapshot) {
+        LOGV2(9999999, "Value being matched: {val}, type={type}",
+              "val"_attr = valueBeingMatched.toString(),
+              "type"_attr = static_cast<int>(valueBeingMatched.getType()));
+
+        uassert(6969001, "matchField must not be empty", !matchField.empty());
+
+        BSONObj matchObj;
+        try {
+            BSONObjBuilder matchBuilder;
+            {
+                BSONObjBuilder outer(matchBuilder.subobjStart("$match"));
+                outer.append(matchField, BSON("$in" << BSON_ARRAY(valueBeingMatched)));
+            }
+            matchObj = matchBuilder.obj();
+        } catch (const DBException& ex) {
+            LOGV2_WARNING(9999999, "Failed to build match object: {error}", "error"_attr = ex.toString());
+            continue;
+        }
+
+        LOGV2(9999999, "Generated match: {match}", "match"_attr = matchObj.toString());
+
+        auto pipeline = buildPipeline(matchObj);
+        uassert(6969002, "Failed to build pipeline", pipeline != nullptr);
+
+        LOGV2(9999999,
+              "Expanding valueBeingMatched: {val}, matchField: {mf}",
+              "val"_attr = valueBeingMatched.toString(),
+              "mf"_attr = matchField);
+
+        while (auto next = pipeline->getNext()) {
+            if (!next) {
+                LOGV2(9999999, "Got null doc from pipeline — skipping.");
+                continue;
+            }
+
+            LOGV2(9999999, "Fetched doc: {doc}", "doc"_attr = next->toString());
+
+            auto id = next->getField("_id");
+
+            LOGV2(9999999,
+                  "Checking if id already visited: id={id}, type={type}",
+                  "id"_attr = id.toString(),
+                  "type"_attr = static_cast<int>(id.getType()));
+
+            if (visited.find(id) == visited.end()) {
+                SearchNode node;
+                node.id = id;
+                node.depth = visited.count(valueBeingMatched)
+                            ? visited[valueBeingMatched].depth + 1
+                            : 0;  // If valueBeingMatched wasn't visited yet (entry point), start from 0
+                node.isForwardDirection = isForward;
+                const auto& cmp = pExpCtx->getValueComparator();
+                if (visited.count(valueBeingMatched)) {
+                    node.parentId = valueBeingMatched;
+                } else {
+                    // This means this is the initial node (startWith / target) — it has no parent
+                    node.parentId = Value(); 
+                }
+
+                visited[id] = node;
+                _visitedUsageBytes += id.getApproximateSize() + next->getApproximateSize();
+
+                LOGV2(9999999,
+                    "Visited node: {id}, depth={depth}, parent={parent}",
+                    "id"_attr = id.toString(),
+                    "depth"_attr = node.depth,
+                    "parent"_attr = valueBeingMatched.toString());
+              
+
+                LOGV2(9999999, "New node visited: {id}", "id"_attr = id.toString());
+
+                document_path_support::visitAllValuesAtPath(
+                    *next,
+                    FieldPath(connectField),
+                    [&](const Value& connectVal) {
+                        LOGV2(9999999, "Found connectVal: {val}, type={type}",
+                              "val"_attr = connectVal.toString(),
+                              "type"_attr = static_cast<int>(connectVal.getType()));
+                        if (visited.find(connectVal) == visited.end()) {
+                            frontier.insert(connectVal);
+                            _frontierUsageBytes += connectVal.getApproximateSize();
+                            LOGV2(9999999, "Added to frontier: {val}", "val"_attr = connectVal.toString());
+                        }
+                    });
+
+                expanded = true;
+            } else {
+                LOGV2(9999999, "Already visited id: {id}", "id"_attr = id.toString());
+            }
+        }
+    }
+
+    LOGV2(9999999,
+          "{dir} expansion complete: visited={v}, frontier={f}",
+          "dir"_attr = isForward ? "Forward" : "Backward",
+          "v"_attr = visited.size(),
+          "f"_attr = frontier.size());
+
+    return expanded;
+}
+
+boost::optional<Value> DocumentSourceBidirectionalGraphLookup::checkMeetingPoint() {
+    LOGV2(9999999,
+          "Checking meeting point - forward size: {fwd}, backward size: {bwd}",
+          "fwd"_attr = _forwardVisited.size(),
+          "bwd"_attr = _backwardVisited.size());
+
+    const auto& cmp = pExpCtx->getValueComparator();
+
+    for (const auto& [fwdId, fwdNode] : _forwardVisited) {
+        LOGV2(9999999, "Checking fwdId: {id}", "id"_attr = fwdId.toString());
+
+        for (const auto& [bwdId, bwdNode] : _backwardVisited) {
+            LOGV2(9999999, "Against bwdId: {id}", "id"_attr = bwdId.toString());
+
+            // Compare using ValueComparator
+            if (cmp.evaluate(fwdId == bwdId)) {
+                LOGV2(9999999,
+                      "Meeting point found - matched fwdId and bwdId: {id}",
+                      "id"_attr = fwdId.toString());
+                return fwdId;
+            } else {
+                LOGV2(9999999,
+                      "Not equal: fwdId={fwd}, bwdId={bwd}",
+                      "fwd"_attr = fwdId.toString(),
+                      "bwd"_attr = bwdId.toString());
+            }
+        }
+    }
+
+    LOGV2(9999999, "No meeting point found.");
+    return boost::none;
+}
+
+std::vector<Document> DocumentSourceBidirectionalGraphLookup::reconstructPath(Value meetingId) {
+    LOGV2(9999999, "Reconstructing path from meetingId: {id}", "id"_attr = meetingId.toString());
+
+    std::vector<Document> result;
+    ValueComparator valueCmp;
+
+    // --- Forward path: from start to meetingId (excluding meetingId for now)
+    std::vector<Value> forwardPath;
+    Value curr = meetingId;
+    while (!_forwardVisited[curr].parentId.missing() &&
+           !valueCmp.evaluate(_forwardVisited[curr].parentId == curr)) {
+        forwardPath.push_back(curr);
+        curr = _forwardVisited[curr].parentId;
+    }
+    forwardPath.push_back(curr);  // Include the start node
+    std::reverse(forwardPath.begin(), forwardPath.end());
+    LOGV2(9999999, "Forward reconstructed path:");
+    for (auto& val : forwardPath) {
+    LOGV2(9999999, " → {id}", "id"_attr = val.toString());
+    }
+
+    // --- Backward path: from meetingId to target (excluding meetingId)
+    std::vector<Value> backwardPath;
+    curr = meetingId;
+    while (!_backwardVisited[curr].parentId.missing() &&
+           !valueCmp.evaluate(_backwardVisited[curr].parentId == curr)) {
+        curr = _backwardVisited[curr].parentId;
+        backwardPath.push_back(curr);
+    }
+
+    LOGV2(9999999, "Backward reconstructed path:");
+    for (auto& val : backwardPath) {
+        LOGV2(9999999, " ← {id}", "id"_attr = val.toString());
+    }
+
+    // Merge paths into result
+    for (auto& val : forwardPath) {
+        result.emplace_back(Document{{"_id", val}});
+    }
+    for (auto& val : backwardPath) {
+        result.emplace_back(Document{{"_id", val}});
+    }
+
+    LOGV2(9999999, "Reconstructed complete path:");
+    for (const auto& doc : result) {
+        LOGV2(9999999, " → {id}", "id"_attr = doc["_id"].toString());
+    }
+
+    return result;
+}
+
  BSONObj DocumentSourceBidirectionalGraphLookup::makeMatchStageFromFrontier(
      const ValueFlatUnorderedSet& frontier) {
      BSONObjBuilder match;
@@ -380,14 +563,27 @@
  }
  
  std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceBidirectionalGraphLookup::buildPipeline(
-     const BSONObj& match) {
-     std::vector<BSONObj> pipelineBson = {match};
-     MakePipelineOptions pipelineOpts;
-     pipelineOpts.optimize = true;
-     pipelineOpts.attachCursorSource = true;
-     
-     return Pipeline::makePipeline(pipelineBson, _fromExpCtx, pipelineOpts);
- }
+    const BSONObj& match) {
+    std::vector<BSONObj> pipelineBson = {match};
+
+    MakePipelineOptions pipelineOpts;
+    pipelineOpts.optimize = true;
+    pipelineOpts.attachCursorSource = true;
+
+    if (_fromNs.isEmpty()) {
+        LOGV2_WARNING(9999998, "Warning: _fromNs is empty at buildPipeline");
+    } else {
+        LOGV2(9999999, "Pipeline built for $lookup fromNs: {ns}", 
+              "ns"_attr = _fromNs.toStringForErrorMsg());
+    }
+
+    auto resolvedNs = pExpCtx->getResolvedNamespace(_fromNs);
+    auto expCtx = pExpCtx->copyWith(_fromNs, resolvedNs.uuid);
+
+    return Pipeline::makePipeline(pipelineBson, expCtx, pipelineOpts);
+
+}
+
  
  void DocumentSourceBidirectionalGraphLookup::checkMemoryUsage() {
      uassert(ErrorCodes::ExceededMemoryLimit,
